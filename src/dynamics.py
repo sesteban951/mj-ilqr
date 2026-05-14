@@ -4,12 +4,19 @@
 #
 ##
 
+# abstract classes
 import os
-import mujoco  
-from mujoco import rollout  
-import numpy as np
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+# for dynamics
+import mujoco
+from mujoco import rollout
+import numpy as np
+
+###############################################################
+# CONFIG and BASE CLASS
+###############################################################
 
 @dataclass
 class MJDynamicsConfig:
@@ -18,8 +25,7 @@ class MJDynamicsConfig:
     u_lb: np.ndarray
     u_ub: np.ndarray
 
-
-class MJDynamics:
+class MJDynamicsBase(ABC):
 
     def __init__(self, config):
         # copy config to self
@@ -28,8 +34,39 @@ class MJDynamics:
         # load model and create data
         self.init_model()
 
+    # load the MuJoCo model and set up dimensions/buffers
+    @abstractmethod
+    def init_model(self):
+        pass
+
+    # return current state x = [qpos; qvel] as (nx,)
+    @abstractmethod
+    def get_state(self):
+        pass
+
+    # set state x = [qpos; qvel] and refresh derived quantities
+    @abstractmethod
+    def set_state(self, x):
+        pass
+
+    # estimate (Ad, Bd) of the discrete map f_disc at (x, u)
+    @abstractmethod
+    def linearize(self, x, u, ilqr_params) -> tuple[np.ndarray, np.ndarray]:
+        pass
+
+
+###############################################################
+# MUJOCO CPU
+###############################################################
+
+class MJDynamics_CPU(MJDynamicsBase):
+
+    def __init__(self, config):
+        super().__init__(config)
+
     # initalize mujoco model
     def init_model(self):
+        # load model and create data
         self.model = mujoco.MjModel.from_xml_path(self.config.xml_path)
         self.data  = mujoco.MjData(self.model)
         print("Model loaded from:", self.config.xml_path)
@@ -102,6 +139,27 @@ class MJDynamics:
         mujoco.mj_step(self.model, self.data)
 
         return self.get_state()
+
+    # dispatch to one of the two linearization methods below
+    def linearize(self, x, u, ilqr_params):
+        """
+        Estimate (Ad, Bd) of the discrete map f_disc at (x, u).
+
+        Dispatches on ilqr_params["linearize_method"]:
+            "mujoco_fd" -> linearize_mujoco_fd       (uses fd_eps, fd_centered)
+            "sampling"  -> linearize_sampling_based  (uses sampling_K, sampling_eps,
+                                                      sampling_reg, sampling_rng)
+        Default is "sampling".
+        """
+        method = ilqr_params.get("linearize_method", "sampling")
+        if method == "mujoco_fd":
+            return self.linearize_mujoco_fd(x, u, ilqr_params)
+        if method == "sampling":
+            return self.linearize_sampling_based(x, u, ilqr_params)
+        raise ValueError(
+            f"unknown linearize_method '{method}'; "
+            f"expected 'mujoco_fd' or 'sampling'"
+        )
 
     # MuJoCo built-in finite-difference linearization of the discrete map
     def linearize_mujoco_fd(self, x, u, ilqr_params):
