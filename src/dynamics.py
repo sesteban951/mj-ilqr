@@ -20,10 +20,17 @@ import numpy as np
 
 @dataclass
 class MJDynamicsConfig:
+
+    # path to MuJoCo XML model
     xml_path: str
+
+    # simulation timestep
     sim_dt: float
+
+    # input bounds
     u_lb: np.ndarray
     u_ub: np.ndarray
+
 
 class MJDynamicsBase(ABC):
 
@@ -79,7 +86,7 @@ class MJDynamics_CPU(MJDynamicsBase):
         self.nv = self.model.nv
         self.nu = self.model.nu
         self.nx = self.nq + self.nv
-        self.dt = float(self.model.opt.timestep)
+        self.dt = round(float(self.model.opt.timestep), 6)
 
         # control box (enforced here, not by MuJoCo)
         self.u_lb = np.asarray(self.config.u_lb, dtype=np.float64)
@@ -145,13 +152,12 @@ class MJDynamics_CPU(MJDynamicsBase):
         """
         Estimate (Ad, Bd) of the discrete map f_disc at (x, u).
 
-        Dispatches on ilqr_params["linearize_method"]:
+        Dispatches on ilqr_params.linearize_method (iLQRConfig field):
             "mujoco_fd" -> linearize_mujoco_fd       (uses fd_eps, fd_centered)
             "sampling"  -> linearize_sampling_based  (uses sampling_K, sampling_eps,
                                                       sampling_reg, sampling_rng)
-        Default is "sampling".
         """
-        method = ilqr_params.get("linearize_method", "sampling")
+        method = ilqr_params.linearize_method
         if method == "mujoco_fd":
             return self.linearize_mujoco_fd(x, u, ilqr_params)
         if method == "sampling":
@@ -170,15 +176,15 @@ class MJDynamics_CPU(MJDynamicsBase):
         Args:
             x:           (nx,) linearization state
             u:           (nu,) linearization control
-            ilqr_params: dict; reads
-                           "fd_eps":      finite-difference step  (optional, default 1e-6)
-                           "fd_centered": centered differences    (optional, default True)
+            ilqr_params: iLQRConfig; reads
+                           .fd_eps      finite-difference step
+                           .fd_centered centered differences (bool)
         Returns:
             Ad: (nx, nx)
             Bd: (nx, nu)
         """
-        eps      = ilqr_params.get("fd_eps", 1e-6)
-        centered = ilqr_params.get("fd_centered", True)
+        eps      = ilqr_params.fd_eps
+        centered = ilqr_params.fd_centered
 
         # set state + control on data and refresh
         self.set_state(x)
@@ -205,11 +211,11 @@ class MJDynamics_CPU(MJDynamicsBase):
         Args:
             x:           (nx,) linearization state
             u:           (nu,) linearization control
-            ilqr_params: dict; reads
-                           "sampling_K":   number of paired samples
-                           "sampling_eps": perturbation scale
-                           "sampling_reg": ridge on the gram matrix (optional, default 1e-8)
-                           "sampling_rng": np.random.Generator      (optional, default fresh)
+            ilqr_params: iLQRConfig; reads
+                           .sampling_K   number of paired samples
+                           .sampling_eps perturbation scale
+                           .sampling_reg ridge on the gram matrix
+                           .sampling_rng np.random.Generator
         Returns:
             Ad: (nx, nx)
             Bd: (nx, nu)
@@ -217,12 +223,10 @@ class MJDynamics_CPU(MJDynamicsBase):
         nx, nu, nq = self.nx, self.nu, self.nq
 
         # sampling knobs from ilqr_params
-        K   = ilqr_params["sampling_K"]
-        eps = ilqr_params["sampling_eps"]
-        reg = ilqr_params.get("sampling_reg", 1e-8)
-        rng = ilqr_params.get("sampling_rng", None)
-        if rng is None:
-            rng = np.random.default_rng()
+        K   = ilqr_params.sampling_K
+        eps = ilqr_params.sampling_eps
+        reg = ilqr_params.sampling_reg
+        rng = ilqr_params.sampling_rng
 
         # joint perturbation z = [xi; eta] ~ N(0, I_{nx+nu})
         xi  = rng.standard_normal((K, nx))
