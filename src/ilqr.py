@@ -120,19 +120,23 @@ class iLQRBase(ABC):
         N, nu = U_nom.shape
         nx    = X_nom.shape[1]
 
+        # initialize trajectory arrays
         X_new    = np.empty((N + 1, nx)); X_new[0] = x0
         U_new    = np.empty((N, nu))
+        
+        # rollout under the iLQR inputs
         xk = x0.copy()
-
         for k in range(N):
             dx = xk - X_nom[k]
             du = alpha * k_ff[k] + K_fb[k] @ dx
             uk = np.clip(U_nom[k] + du, self.dyn.u_lb, self.dyn.u_ub)
-            U_new[k] = uk
             xk = self.dyn.f_disc(xk, uk, clip=True)
+            U_new[k] = uk
             X_new[k + 1] = xk
 
+        # evaluate the new trajectory cost
         J_new = self.cost(X_new, U_new)
+
         return X_new, U_new, J_new
 
     # Riccati-style backward sweep with LM regularization + box-constrained QP at each step
@@ -151,7 +155,6 @@ class iLQRBase(ABC):
         The feedback gain rows for clamped controls are nullified (Tassa III-C.2),
         and the free-row gains use the reduced Hessian:
             K_fb[k][f, :] = -Quu_reg[f, f]^{-1} Qux[f, :].
-
         Also accumulates the first-order directional derivative of the trajectory
         cost along the iLQR search direction (used by the outer Armijo test):
             dV1 = sum_k  k_ff_k^T Q_u_k     (= dJ_model/dalpha at alpha=0,
@@ -161,7 +164,6 @@ class iLQRBase(ABC):
             X, U:             nominal trajectory and controls
             Ad_seq, Bd_seq:   per-step Jacobians from linearize_about_trajectory
             mu:               scalar LM regularization on Quu
-
         Returns:
             k_ff_seq: (N, nu)
             K_fb_seq: (N, nu, nx)
@@ -182,6 +184,7 @@ class iLQRBase(ABC):
         luu_all = self.l_uu(X_stage, U)           # (N, nu, nu)
         lux_all = self.l_ux(X_stage, U)           # (N, nu, nx)
 
+        # initialize feedforward / feedback arrays
         k_ff_seq = np.zeros((N, nu))
         K_fb_seq = np.zeros((N, nu, nx))
 
@@ -189,13 +192,14 @@ class iLQRBase(ABC):
         Vx  = self.lf_x (X[-1:])[0]               # (nx,)
         Vxx = self.lf_xx(X[-1:])[0]               # (nx, nx)
 
+        # initialize LM regularization matrix
         mu_I = mu * np.eye(nu)
         dV1  = 0.0
 
         # main backwards pass: optimal feedforward k_ff and feedback K_fb at each step
         warm = None
         for k in range(N - 1, -1, -1):
-            Ad, Bd = Ad_seq[k], Bd_seq[k]
+            Ad,  Bd  = Ad_seq[k],  Bd_seq[k]
             lx,  lu  = lx_all[k],  lu_all[k]
             lxx, luu = lxx_all[k], luu_all[k]
             lux      = lux_all[k]
@@ -217,10 +221,8 @@ class iLQRBase(ABC):
             k_ff, free, L_ff, _, status = boxqp(Quu_reg, Qu, lb_k, ub_k, x0=warm)
             warm = k_ff
 
+            # QP failure
             if status != "ok":
-                # QP did not reach a stationary point (not_descent / tiny_step / max_iter)
-                # -> caller bumps mu and retries; using a sub-optimal k_ff would corrupt
-                # dV1 and the value-function update
                 return k_ff_seq, K_fb_seq, 0.0, False
 
             # feedback: zero rows for clamped controls, reduced-Hessian solve for free rows
@@ -243,6 +245,125 @@ class iLQRBase(ABC):
             Vxx = 0.5 * (Vxx + Vxx.T)                       # symmetrize
 
         return k_ff_seq, K_fb_seq, dV1, True
+
+
+    # outer iLQR loop: linearize -> backward pass -> Armijo line search, with LM
+    def solve(self, x0, U_init):
+        """
+        Run iLQR to convergence (or max_iter) starting from an initial control guess.
+
+        Args:
+            x0:     (nx,) initial state
+            U_init: (N, nu) initial control sequence (will be clipped to [u_lb, u_ub])
+        Returns:
+            X:      (N+1, nx) final state trajectory
+            U:      (N, nu)   final control sequence
+            J_hist: list[float]; J_hist[0] is the initial cost
+        """
+        cfg = self.config
+        dyn = self.dyn
+
+        N      = U_init.shape[0]
+        nx, nu = dyn.nx, dyn.nu
+
+        max_iter   = cfg.max_iter
+        tol        = cfg.tol
+        mu         = cfg.mu
+        mu_min     = cfg.mu_min
+        mu_max     = cfg.mu_max
+        mu_factor  = cfg.mu_factor
+        alpha_init = cfg.alpha_init
+        alpha_beta = cfg.alpha_beta
+        alpha_min  = cfg.alpha_min
+        c1         = cfg.armijo_c
+
+        # initial open-loop rollout of U_init (with clipping)
+        X = np.empty((N + 1, nx)); 
+        U = np.empty((N, nu))
+        X[0] = x0
+        xk = x0.copy()
+        for k in range(N):
+            U[k] = np.clip(U_init[k], dyn.u_lb, dyn.u_ub)
+            xk = dyn.f_disc(xk, U[k], clip=True)
+            X[k + 1] = xk
+        J = self.cost(X, U)
+        J_hist = [float(J)]
+        print(f"[iLQR] iter   0: J={float(J):.4f}")
+
+        # main iLQR loop
+        it = 0
+        while it < max_iter:
+            # linearize + backward pass
+            Ad_seq, Bd_seq = self.linearize_about_trajectory(X, U)
+            k_ff, K_fb, dV1, ok = self.backward_pass(X, U, Ad_seq, Bd_seq, mu)
+
+            # backward pass failed -> bump mu and retry (no iteration bump)
+            if not ok:
+                mu = min(mu * mu_factor, mu_max)
+                print(f"[iLQR] iter {it:3d}: backward pass failed, mu -> {mu:.2e}")
+                if mu >= mu_max:
+                    print(f"[iLQR] mu hit mu_max={mu_max:.2e}; stopping.")
+                    break
+                continue
+
+            # Classic Armijo line search with geometric backtracking:
+            #   start at alpha = alpha_init; multiply by alpha_beta on each rejection;
+            #   stop when alpha < alpha_min (-> reject this backward pass, bump mu).
+            # First-order predicted reduction along the iLQR search direction:
+            #   E(a) = -a * dV1,   with dV1 = sum_k k_ff_k^T Q_u_k  (= dJ/da at a=0).
+            # Accept iff   (J - J_try) >= c1 * E(a).
+            accepted     = False
+            alpha_used   = None
+            dJ           = 0.0
+            z_used       = 0.0
+            exp_red_used = 0.0
+
+            # check if the search direction is a descent direction
+            if dV1 >= 0.0:
+                # not a descent direction; bail out so the outer loop bumps mu
+                # (Quu_reg likely lost positive definiteness)
+                a = alpha_min - 1.0
+            else:
+                a = alpha_init
+
+            while a >= alpha_min:
+                exp_red = -a * dV1                   # first-order expected reduction (> 0)
+                X_try, U_try, J_try = self.forward_pass(x0, X, U, k_ff, K_fb, a)
+                dJ_actual = float(J) - float(J_try)
+                if dJ_actual >= c1 * exp_red:
+                    z_used       = dJ_actual / exp_red
+                    exp_red_used = exp_red
+                    dJ           = dJ_actual
+                    X, U, J      = X_try, U_try, J_try
+                    accepted     = True
+                    alpha_used   = a
+                    break
+                a *= alpha_beta
+
+            # good step: decrease mu, count iteration, log, check convergence
+            if accepted:
+                it += 1
+                mu = max(mu / mu_factor, mu_min)
+                J_hist.append(float(J))
+                print(f"[iLQR] iter {it:3d}: J={float(J):.4f}  dJ={dJ:.3e}  "
+                      f"alpha={alpha_used:.4f}  z={z_used:.2f}  "
+                      f"E={exp_red_used:.3e}  mu={mu:.2e}")
+                if abs(dJ) < tol or (exp_red_used > 0.0 and exp_red_used < tol):
+                    print(f"[iLQR] converged: |dJ|={abs(dJ):.2e}, "
+                          f"E={exp_red_used:.2e} < tol={tol:.2e}")
+                    break
+            # bad step: increase mu and retry (no iteration bump)
+            else:
+                mu = min(mu * mu_factor, mu_max)
+                print(f"[iLQR] iter {it:3d}: line search failed "
+                      f"(dV1={dV1:.2e}), mu -> {mu:.2e}")
+                if mu >= mu_max:
+                    print(f"[iLQR] mu hit mu_max={mu_max:.2e}; stopping.")
+                    break
+
+        print(f"[iLQR] done in {len(J_hist) - 1} accepted iterations. "
+              f"J: {J_hist[0]:.4f} -> {J_hist[-1]:.4f}")
+        return X, U, J_hist
 
 
     # evaluate total trajectory cost J(X, U)

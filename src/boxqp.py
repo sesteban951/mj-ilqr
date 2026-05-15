@@ -1,6 +1,10 @@
-"""
-Box-constrained quadratic program solver.
+##
+#
+# Box-constrained quadratic program solver.
+#
+##
 
+"""
 Solves
     min   0.5 * x^T H x + q^T x
     s.t.  lb <= x <= ub                                     (elementwise)
@@ -18,7 +22,7 @@ import numpy as np
 
 def boxqp(H, q, lb, ub, x0=None,
           tol=1e-5, max_iter=100,
-          armijo_c=0.1, step_dec=0.5, min_step=1e-22):
+          armijo_c=0.1, step_dec=0.5, min_step=1e-10):
     """
     Args:
         H:        (n, n) symmetric (assumed PSD on the free subspace)
@@ -52,7 +56,7 @@ def boxqp(H, q, lb, ub, x0=None,
         x = np.clip(np.asarray(x0, dtype=float).copy(), lb, ub)
 
     # tolerance for "x is at a bound" (relative to box width, with floor)
-    bound_tol = 1e-12 * np.maximum(1.0, np.abs(ub - lb))
+    bound_tol = 1e-9 * np.maximum(1.0, np.abs(ub - lb))
 
     L_ff = None
     free = np.ones(n, dtype=bool)
