@@ -215,7 +215,8 @@ class iLQRBase(ABC):
             Quu_reg = Quu + mu_I
 
             # box-constrained QP for the feedforward step:
-            #   min  0.5 du^T Quu_reg du + Qu^T du   s.t.   u_lb - U[k] <= du <= u_ub - U[k]
+            #   min  0.5 du^T Quu_reg du + Qu^T du   
+            #   s.t. u_lb - U[k] <= du <= u_ub - U[k]
             lb_k = u_lb - U[k]
             ub_k = u_ub - U[k]
             k_ff, free, L_ff, _, status = boxqp(Quu_reg, Qu, lb_k, ub_k, x0=warm)
@@ -228,18 +229,17 @@ class iLQRBase(ABC):
             # feedback: zero rows for clamped controls, reduced-Hessian solve for free rows
             K_fb = np.zeros((nu, nx))
             if L_ff is not None and free.any():
-                Qux_f = Qux[free]                                   # (nf, nx)
-                z     = np.linalg.solve(L_ff,    Qux_f)
-                y     = np.linalg.solve(L_ff.T,  z)                 # Quu_reg[f,f]^{-1} Qux[f,:]
+                Qux_f = Qux[free]                        # (nf, nx)
+                z     = np.linalg.solve(L_ff,    Qux_f)  # z = L_ff^{-1} Qux[f,:]
+                y     = np.linalg.solve(L_ff.T,  z)      # Quu_reg[f,f]^{-1} Qux[f,:]
                 K_fb[free] = -y
-
             k_ff_seq[k] = k_ff
             K_fb_seq[k] = K_fb
 
             # first-order directional derivative of trajectory cost along k_ff
             dV1 += float(k_ff @ Qu)
 
-            # value-function update (general form, doesn't assume optimal gains)
+            # value-function update (general form, doesn't assume optimal gains) WARNING: check this
             Vx  = Qx  + K_fb.T @ Quu_reg @ k_ff + K_fb.T @ Qu  + Qux.T @ k_ff
             Vxx = Qxx + K_fb.T @ Quu_reg @ K_fb + K_fb.T @ Qux + Qux.T @ K_fb
             Vxx = 0.5 * (Vxx + Vxx.T)                       # symmetrize
