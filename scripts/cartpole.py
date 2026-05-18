@@ -26,7 +26,7 @@ from ilqr     import iLQRBase, iLQRConfig
 
 
 ###############################################################
-# CARTPOLE iLQR (concrete subclass)
+# CARTPOLE iLQR
 ###############################################################
 
 class CartpoleILQR(iLQRBase):
@@ -121,34 +121,35 @@ if __name__ == "__main__":
     repo = os.path.abspath(os.path.join(_here, ".."))
 
     dyn_cfg = MJDynamicsConfig(
-        # xml_path = os.path.join(repo, "models", "cartpole", "cartpole.xml"),
-        xml_path = os.path.join(repo, "models", "cartpole", "cartpole_walls_soft.xml"),
+        xml_path = os.path.join(repo, "models", "cartpole", "cartpole.xml"),
+        # xml_path = os.path.join(repo, "models", "cartpole", "cartpole_walls.xml"),
+        # xml_path = os.path.join(repo, "models", "cartpole", "cartpole_walls_soft.xml"),
         sim_dt   = 0.01,
         u_lb     = np.array([-100.0]),
         u_ub     = np.array([ 100.0]),
     )
 
     ilqr_cfg = iLQRConfig(
-        max_iter         = 300,
-        tol              = 1e-2,
-        mu               = 1.0,
-        mu_min           = 1e-6,
-        mu_max           = 1e10,
-        mu_factor        = 2.0,
-        alpha_init       = 1.0,
-        alpha_beta       = 0.5,
-        alpha_min        = 1e-4,
-        armijo_c         = 1e-4,
-        linearize_method = "sampling",
-        sampling_K       = 256,
-        sampling_eps     = 5e-2,
-        sampling_rng     = np.random.default_rng(0),
+        max_iter                  = 200,
+        tol                       = 1e-2,
+        mu                        = 1.0,
+        mu_min                    = 1e-6,
+        mu_max                    = 1e10,
+        mu_factor                 = 2.0,
+        regularization_type       = "control",   # "control" | "value"
+        max_bp_iter               = 5,
+        num_linesearch_candidates = 16,
+        min_linesearch_step       = 1e-5,
+        linearize_method          = "sampling", # "sampling" | "mujoco_fd"
+        sampling_K                = 256,
+        sampling_eps              = 5e-2,
+        sampling_rng              = np.random.default_rng(0),
     )
 
     ilqr = CartpoleILQR(dyn_cfg, ilqr_cfg)
 
     # horizon (number of control knots)
-    T = 500
+    T = 450
 
     # initial state: cart at origin, pole hanging down (theta = pi), at rest
     x0 = np.array([0.0, np.pi, 0.0, 0.0])

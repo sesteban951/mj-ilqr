@@ -2,6 +2,13 @@
 #
 # iLQR algorithm.
 #
+# Upgrades over textbook Tassa-2014, ported from mujoco_mpc's iLQG planner:
+#   1. quadratic expected improvement  E(α) = -α (dV1 + α dV2)
+#   2. Tassa z-ratio adaptive mu schedule (rate itself accelerates)
+#   3. value-regularization mode      Vxx_reg = Vxx + mu I
+#   4. inline Cholesky-failure retry in backward pass
+#   5. parallel multi-α line search via mujoco.rollout.Rollout
+#
 ##
 
 # abstract classes
@@ -11,6 +18,7 @@ import copy
 
 # standard
 import numpy as np
+import mujoco
 
 # dynamics
 from dynamics import MJDynamics_CPU, MJDynamicsConfig
@@ -29,17 +37,19 @@ class iLQRConfig:
     max_iter: int   = 150
     tol:      float = 1e-2
 
-    # Levenberg-Marquardt regularization on Quu
+    # Levenberg-Marquardt regularization
     mu:        float = 1.0
     mu_min:    float = 1e-6
     mu_max:    float = 1e10
     mu_factor: float = 2.0
+    regularization_type: str = "control"   # "control" (mu on Quu) | "value" (mu on Vxx)
 
-    # geometric backtracking Armijo line search
-    alpha_init: float = 1.0
-    alpha_beta: float = 0.5
-    alpha_min:  float = 1e-4
-    armijo_c:   float = 1e-4
+    # backward-pass inline retry cap on Cholesky / boxQP failure
+    max_bp_iter: int = 5
+
+    # parallel multi-α line search (replaces geometric Armijo backtracking)
+    num_linesearch_candidates: int   = 8
+    min_linesearch_step:       float = 1e-3
 
     # linearization method: "sampling" or "mujoco_fd"
     linearize_method: str = "sampling"
@@ -58,14 +68,10 @@ class iLQRConfig:
 class iLQRBase(ABC):
 
     def __init__(self, dyn_config: MJDynamicsConfig, ilqr_config: iLQRConfig):
-
-        # iLQR config
         self.config = copy.deepcopy(ilqr_config)
-        
-        # Dynamics from config
-        self.dyn = MJDynamics_CPU(dyn_config)
+        self.dyn    = MJDynamics_CPU(dyn_config)
 
-    
+
     # linearize the discrete dynamics at every knot of the nominal trajectory
     def linearize_about_trajectory(self, X, U):
         """
@@ -83,20 +89,16 @@ class iLQRBase(ABC):
         N      = U.shape[0]
         nx, nu = self.dyn.nx, self.dyn.nu
 
-        # initialize arrays
         Ad_seq = np.empty((N, nx, nx))
         Bd_seq = np.empty((N, nx, nu))
-
-        # linearize at each knot
         for k in range(N):
             Ad, Bd = self.dyn.linearize(X[k], U[k], self.config)
             Ad_seq[k] = Ad
             Bd_seq[k] = Bd
-
         return Ad_seq, Bd_seq
 
 
-    # closed-loop rollout under the iLQR control law for line-search step alpha
+    # single-trajectory closed-loop rollout (used for tests / single-α probes)
     def forward_pass(self, x0, X_nom, U_nom, k_ff, K_fb, alpha):
         """
         Closed-loop rollout:
@@ -104,14 +106,6 @@ class iLQRBase(ABC):
             du[k]      = alpha * k_ff[k] + K_fb[k] @ dx[k]
             u_new[k]   = clamp(u_nom[k] + du[k], u_lb, u_ub)
             x_new[k+1] = f_disc(x_new[k], u_new[k])    # clip=True (physical rollout)
-
-        Args:
-            x0:    (nx,)        initial state
-            X_nom: (N+1, nx)    nominal state trajectory
-            U_nom: (N,   nu)    nominal control sequence
-            k_ff:  (N,   nu)    feedforward gains from backward pass
-            K_fb:  (N,   nu, nx) feedback gains from backward pass
-            alpha: float        line-search step size in [alpha_min, alpha_init]
         Returns:
             X_new: (N+1, nx)
             U_new: (N,   nu)    actually-applied (clamped) controls
@@ -120,11 +114,9 @@ class iLQRBase(ABC):
         N, nu = U_nom.shape
         nx    = X_nom.shape[1]
 
-        # initialize trajectory arrays
         X_new    = np.empty((N + 1, nx)); X_new[0] = x0
         U_new    = np.empty((N, nu))
-        
-        # rollout under the iLQR inputs
+
         xk = x0.copy()
         for k in range(N):
             dx = xk - X_nom[k]
@@ -134,127 +126,288 @@ class iLQRBase(ABC):
             U_new[k] = uk
             X_new[k + 1] = xk
 
-        # evaluate the new trajectory cost
         J_new = self.cost(X_new, U_new)
-
         return X_new, U_new, J_new
 
-    # Riccati-style backward sweep with LM regularization + box-constrained QP at each step
-    def backward_pass(self, X, U, Ad_seq, Bd_seq, mu):
-        """
-        Riccati-style backward sweep with Levenberg-Marquardt regularization and
-        box-constrained control updates (Tassa, Mansard & Todorov 2014).
 
-        For k = N-1..0, build the local Q-function around (X[k], U[k]) using the
-        cost derivatives and the perturbation dynamics dx_{k+1} = Ad_k dx_k + Bd_k du_k,
-        then compute feedforward / feedback gains
-            du_k = k_ff[k] + K_fb[k] dx_k
-        by solving the box-constrained QP
-            min   0.5 * du^T Quu_reg du + Qu^T du
-            s.t.  u_lb - U[k] <= du <= u_ub - U[k].
-        The feedback gain rows for clamped controls are nullified (Tassa III-C.2),
-        and the free-row gains use the reduced Hessian:
-            K_fb[k][f, :] = -Quu_reg[f, f]^{-1} Qux[f, :].
-        Also accumulates the first-order directional derivative of the trajectory
-        cost along the iLQR search direction (used by the outer Armijo test):
-            dV1 = sum_k  k_ff_k^T Q_u_k     (= dJ_model/dalpha at alpha=0,
-                                              < 0 for a descent direction)
+    # parallel multi-α closed-loop rollouts via the batched mujoco rollout pool
+    def forward_pass_batched(self, x0, X_nom, U_nom, k_ff, K_fb, alphas):
+        """
+        Closed-loop rollouts for K candidate step sizes, run in parallel via the
+        thread pool that backs self.dyn._rollout. One mj_step per timestep across
+        all K candidates at once.
+
+        Mirrors mujoco_mpc/mjpc/planners/ilqg/planner.cc:ActionRollouts (parallel
+        ThreadPool dispatch of num_trajectory_ rollouts at log-spaced alphas).
 
         Args:
-            X, U:             nominal trajectory and controls
-            Ad_seq, Bd_seq:   per-step Jacobians from linearize_about_trajectory
-            mu:               scalar LM regularization on Quu
+            x0:     (nx,) initial state shared by all candidates
+            X_nom:  (N+1, nx) nominal state trajectory
+            U_nom:  (N,   nu) nominal controls
+            k_ff:   (N,   nu) feedforward gains
+            K_fb:   (N,   nu, nx) feedback gains
+            alphas: (K,)  step sizes; the last one should be 0.0 to keep the
+                          nominal trajectory as a candidate (safety net).
+        Returns:
+            X_all:  (K, N+1, nx)
+            U_all:  (K, N,   nu)
+            J_all:  (K,)    total cost; np.inf for candidates that diverged
+            failed: (K,)    bool, True if non-finite state encountered
+        """
+        K   = len(alphas)
+        alphas = np.asarray(alphas, dtype=np.float64).reshape(K)
+        N, nu = U_nom.shape
+        nx    = X_nom.shape[1]
+        dyn   = self.dyn
+
+        X_all  = np.empty((K, N + 1, nx))
+        U_all  = np.empty((K, N, nu))
+        failed = np.zeros(K, dtype=bool)
+        X_all[:, 0] = x0[None, :]
+        x_curr      = X_all[:, 0].copy()                       # (K, nx)
+
+        # FULLPHYSICS state template (only qpos/qvel are perturbed per candidate)
+        spec    = dyn._full_state_spec
+        nstate  = dyn._nstate
+        qs, vs  = dyn._qpos_slice, dyn._qvel_slice
+        dyn.set_state(x0)
+        ref_state = np.zeros(nstate, dtype=np.float64)
+        mujoco.mj_getState(dyn.model, dyn.data, ref_state, spec)
+        init_states = np.tile(ref_state, (K, 1))               # (K, nstate)
+        control     = np.empty((K, 1, nu), dtype=np.float64)
+
+        for k in range(N):
+            # K candidate controls (clipped to box bounds)
+            for i in range(K):
+                dx = x_curr[i] - X_nom[k]
+                du = alphas[i] * k_ff[k] + K_fb[k] @ dx
+                u  = np.clip(U_nom[k] + du, dyn.u_lb, dyn.u_ub)
+                U_all[i, k]   = u
+                control[i, 0] = u
+
+            # pack K initial states for this step
+            init_states[:, qs] = x_curr[:, :dyn.nq]
+            init_states[:, vs] = x_curr[:, dyn.nq:]
+
+            # batched one-step rollout across the thread pool
+            states, _ = dyn._rollout.rollout(
+                dyn.model, dyn._rollout_data, init_states, control, nstep=1
+            )                                                  # (K, 1, nstate)
+
+            # extract next [qpos; qvel] for each candidate
+            nxt = np.concatenate([states[:, 0, qs], states[:, 0, vs]], axis=1)
+
+            # divergence guard: park failed candidates at x0 to avoid NaN propagation
+            bad = ~np.all(np.isfinite(nxt), axis=1)
+            if bad.any():
+                failed |= bad
+                nxt[bad] = x0
+
+            X_all[:, k + 1] = nxt
+            x_curr          = nxt
+
+        # cost per candidate; failed -> inf
+        J_all = np.full(K, np.inf, dtype=np.float64)
+        for i in range(K):
+            if not failed[i]:
+                J_all[i] = self.cost(X_all[i], U_all[i])
+        return X_all, U_all, J_all, failed
+
+
+    # Riccati-style backward sweep with inline retry, value- or control-LM, and dV2
+    def backward_pass(self, X, U, Ad_seq, Bd_seq, mu):
+        """
+        Riccati-style backward sweep with:
+          - control- or value-regularization (cfg.regularization_type)
+          - inline mu-bump retry on Cholesky/boxQP failure (cap = cfg.max_bp_iter)
+          - quadratic expected-improvement tracking dV = (dV1, dV2)
+          - box-constrained feedforward via projected-Newton boxQP
+
+        For k = N-1..0, build the local Q-function around (X[k], U[k]) and compute
+            du_k = k_ff[k] + K_fb[k] dx_k
+        by solving the box-constrained QP
+            min   0.5 du^T Quu_reg du + Qu^T du
+            s.t.  u_lb - U[k] <= du <= u_ub - U[k].
+
+        Regularization (mujoco_mpc/mjpc/planners/ilqg/backward_pass.cc:116-153):
+          "control":  Quu_reg = Quu + mu I,                 Qux_reg = Qux
+          "value":    Vxx_reg = Vxx + mu I, then
+                      Quu_reg = luu + B^T Vxx_reg B,
+                      Qux_reg = lux + B^T Vxx_reg A.
+
+        Args:
+            X, U:           nominal trajectory and controls
+            Ad_seq, Bd_seq: per-step Jacobians from linearize_about_trajectory
+            mu:             scalar LM regularization (may be increased on retry)
         Returns:
             k_ff_seq: (N, nu)
             K_fb_seq: (N, nu, nx)
-            dV1:      float   first-order directional derivative along k_ff
-            success:  bool    False if any QP did not converge to a stationary point
+            dV1:      float    sum_k k_ff_k^T Q_u_k           (linear; < 0 for descent)
+            dV2:      float    sum_k 0.5 k_ff_k^T Quu_reg k_ff_k  (quadratic; >= 0)
+            mu:       float    possibly-bumped regularization after inline retries
+            success:  bool     False if max_bp_iter retries exhausted
         """
-        N      = U.shape[0]
-        nx     = X.shape[1]
-        nu     = U.shape[1]
-        u_lb   = self.dyn.u_lb
-        u_ub   = self.dyn.u_ub
+        cfg   = self.config
+        N     = U.shape[0]
+        nx    = X.shape[1]
+        nu    = U.shape[1]
+        u_lb  = self.dyn.u_lb
+        u_ub  = self.dyn.u_ub
+
+        reg_type    = cfg.regularization_type
+        max_bp_iter = cfg.max_bp_iter
+        mu_max      = cfg.mu_max
+        mu_factor   = cfg.mu_factor
 
         # bulk-evaluate cost derivatives along the nominal trajectory
         X_stage = X[:-1]                          # (N, nx)
-        lx_all  = self.l_x (X_stage, U)           # (N, nx)
-        lxx_all = self.l_xx(X_stage, U)           # (N, nx, nx)
-        lu_all  = self.l_u (X_stage, U)           # (N, nu)
-        luu_all = self.l_uu(X_stage, U)           # (N, nu, nu)
-        lux_all = self.l_ux(X_stage, U)           # (N, nu, nx)
+        lx_all  = self.l_x (X_stage, U)
+        lxx_all = self.l_xx(X_stage, U)
+        lu_all  = self.l_u (X_stage, U)
+        luu_all = self.l_uu(X_stage, U)
+        lux_all = self.l_ux(X_stage, U)
 
-        # initialize feedforward / feedback arrays
+        # terminal cost-to-go (recomputed at every retry — cheap)
+        lfx_T  = self.lf_x (X[-1:])[0]
+        lfxx_T = self.lf_xx(X[-1:])[0]
+
+        eye_x = np.eye(nx)
+        eye_u = np.eye(nu)
+
         k_ff_seq = np.zeros((N, nu))
         K_fb_seq = np.zeros((N, nu, nx))
 
-        # terminal cost-to-go
-        Vx  = self.lf_x (X[-1:])[0]               # (nx,)
-        Vxx = self.lf_xx(X[-1:])[0]               # (nx, nx)
+        # Inline retry loop: if any QP fails, bump mu and restart from k = N-1.
+        # mujoco_mpc/mjpc/planners/ilqg/backward_pass.cc:445-509
+        for _ in range(max_bp_iter):
+            Vx  = lfx_T.copy()
+            Vxx = lfxx_T.copy()
+            dV1 = 0.0
+            dV2 = 0.0
+            warm = None
+            success = True
 
-        # initialize LM regularization matrix
-        mu_I = mu * np.eye(nu)
-        dV1  = 0.0
+            for k in range(N - 1, -1, -1):
+                Ad,  Bd  = Ad_seq[k],  Bd_seq[k]
+                lx,  lu  = lx_all[k],  lu_all[k]
+                lxx, luu = lxx_all[k], luu_all[k]
+                lux      = lux_all[k]
 
-        # main backwards pass: optimal feedforward k_ff and feedback K_fb at each step
-        warm = None
-        for k in range(N - 1, -1, -1):
-            Ad,  Bd  = Ad_seq[k],  Bd_seq[k]
-            lx,  lu  = lx_all[k],  lu_all[k]
-            lxx, luu = lxx_all[k], luu_all[k]
-            lux      = lux_all[k]
+                # Q-function derivatives — UNREGULARIZED throughout.
+                # (mjpc uses unreg Quut/Qxut for dV and the V-function update;
+                #  reg versions enter only the QP solve direction.)
+                Qx  = lx  + Ad.T @ Vx
+                Qu  = lu  + Bd.T @ Vx
+                Qxx = lxx + Ad.T @ Vxx @ Ad
+                Qux = lux + Bd.T @ Vxx @ Ad
+                Quu = luu + Bd.T @ Vxx @ Bd
 
-            # Q-function derivatives
-            Qx  = lx  + Ad.T @ Vx
-            Qu  = lu  + Bd.T @ Vx
-            Qxx = lxx + Ad.T @ Vxx @ Ad
-            Qux = lux + Bd.T @ Vxx @ Ad
-            Quu = luu + Bd.T @ Vxx @ Bd
+                # regularized versions for the QP solve only
+                # (mujoco_mpc/mjpc/planners/ilqg/backward_pass.cc:116-153)
+                if reg_type == "value":
+                    Vxx_reg = Vxx + mu * eye_x
+                    Qux_reg = lux + Bd.T @ Vxx_reg @ Ad
+                    Quu_reg = luu + Bd.T @ Vxx_reg @ Bd
+                else:  # "control"
+                    Qux_reg = Qux
+                    Quu_reg = Quu + mu * eye_u
 
-            # Tikhonov-regularize Quu for the QP Hessian
-            Quu_reg = Quu + mu_I
+                # box-constrained QP for the feedforward step
+                lb_k = u_lb - U[k]
+                ub_k = u_ub - U[k]
+                k_ff, free, L_ff, _, status = boxqp(Quu_reg, Qu, lb_k, ub_k, x0=warm)
+                warm = k_ff
 
-            # box-constrained QP for the feedforward step:
-            #   min  0.5 du^T Quu_reg du + Qu^T du   
-            #   s.t. u_lb - U[k] <= du <= u_ub - U[k]
-            lb_k = u_lb - U[k]
-            ub_k = u_ub - U[k]
-            k_ff, free, L_ff, _, status = boxqp(Quu_reg, Qu, lb_k, ub_k, x0=warm)
-            warm = k_ff
+                if status != "ok":
+                    success = False
+                    break
 
-            # QP failure
-            if status != "ok":
-                return k_ff_seq, K_fb_seq, 0.0, False
+                # feedback: zero rows for clamped controls, reduced-Hessian solve for free
+                K_fb = np.zeros((nu, nx))
+                if L_ff is not None and free.any():
+                    Qux_f = Qux_reg[free]
+                    z_sol = np.linalg.solve(L_ff,    Qux_f)
+                    y_sol = np.linalg.solve(L_ff.T,  z_sol)
+                    K_fb[free] = -y_sol
 
-            # feedback: zero rows for clamped controls, reduced-Hessian solve for free rows
-            K_fb = np.zeros((nu, nx))
-            if L_ff is not None and free.any():
-                Qux_f = Qux[free]                        # (nf, nx)
-                z     = np.linalg.solve(L_ff,    Qux_f)  # z = L_ff^{-1} Qux[f,:]
-                y     = np.linalg.solve(L_ff.T,  z)      # Quu_reg[f,f]^{-1} Qux[f,:]
-                K_fb[free] = -y
-            k_ff_seq[k] = k_ff
-            K_fb_seq[k] = K_fb
+                k_ff_seq[k] = k_ff
+                K_fb_seq[k] = K_fb
 
-            # first-order directional derivative of trajectory cost along k_ff
-            dV1 += float(k_ff @ Qu)
+                # expected-improvement accumulators — unregularized Quu, Qu
+                # (mujoco_mpc/mjpc/planners/ilqg/backward_pass.cc:223-226)
+                dV1 += float(k_ff @ Qu)
+                dV2 += 0.5 * float(k_ff @ Quu @ k_ff)
 
-            # value-function update (general form, doesn't assume optimal gains) WARNING: check this
-            Vx  = Qx  + K_fb.T @ Quu_reg @ k_ff + K_fb.T @ Qu  + Qux.T @ k_ff
-            Vxx = Qxx + K_fb.T @ Quu_reg @ K_fb + K_fb.T @ Qux + Qux.T @ K_fb
-            Vxx = 0.5 * (Vxx + Vxx.T)                       # symmetrize
+                # value-function update — unregularized Quu, Qux
+                # Vx  = Qx + Qux^T k + K^T (Qu + Quu k)
+                # Vxx = Qxx + Qux^T K + K^T Qux + K^T Quu K
+                Vx  = Qx  + Qux.T @ k_ff + K_fb.T @ (Qu + Quu @ k_ff)
+                Vxx = Qxx + Qux.T @ K_fb + K_fb.T @ Qux + K_fb.T @ Quu @ K_fb
+                Vxx = 0.5 * (Vxx + Vxx.T)
 
-        return k_ff_seq, K_fb_seq, dV1, True
+            if success:
+                return k_ff_seq, K_fb_seq, dV1, dV2, mu, True
+
+            # QP failed at some knot — bump mu and retry
+            mu = min(mu * mu_factor, mu_max)
+            if mu >= mu_max:
+                break
+
+        return k_ff_seq, K_fb_seq, 0.0, 0.0, mu, False
 
 
-    # outer iLQR loop: linearize -> backward pass -> Armijo line search, with LM
+    # Tassa adaptive mu / rate update via z-ratio (actual / expected) and step size
+    def _update_mu(self, mu, mu_rate, z, s):
+        """
+        Adaptive regularization update mirroring mjpc UpdateRegularization +
+        ScaleRegularization (backward_pass.cc:330-356):
+
+          bad   (z or s NaN / non-positive)  -> rate <- factor^2-direction
+          good  (z > 0.5 or s > 0.3)         -> rate <- 1/factor-direction
+          poor  (z < 0.1 or s < 0.06)        -> rate <- factor-direction
+          else                                -> no change
+
+        rate accelerates with same-direction bumps:
+            grow:   rate = max(rate * scale, scale)
+            shrink: rate = min(rate * scale, scale)
+        Effective update: mu <- clip(mu * rate, mu_min, mu_max).
+        """
+        cfg    = self.config
+        factor = cfg.mu_factor
+        mu_min = cfg.mu_min
+        mu_max = cfg.mu_max
+
+        # thresholds from mjpc (backward_pass.cc:341-356)
+        Z_HI, Z_LO = 0.5,  0.1
+        S_HI, S_LO = 0.3,  0.06
+
+        z_bad = (not np.isfinite(z)) or z <= 0.0
+        s_bad = (not np.isfinite(s)) or s <= 0.0
+
+        if z_bad or s_bad:
+            scale = factor * factor
+            mu_rate = max(mu_rate * scale, scale)
+        elif z > Z_HI or s > S_HI:
+            scale = 1.0 / factor
+            mu_rate = min(mu_rate * scale, scale)
+        elif z < Z_LO or s < S_LO:
+            scale = factor
+            mu_rate = max(mu_rate * scale, scale)
+        else:
+            return mu, mu_rate                                  # no change
+
+        mu = min(max(mu * mu_rate, mu_min), mu_max)
+        return mu, mu_rate
+
+
+    # outer iLQR loop with parallel α line search and Tassa z-ratio mu schedule
     def solve(self, x0, U_init):
         """
         Run iLQR to convergence (or max_iter) starting from an initial control guess.
 
         Args:
             x0:     (nx,) initial state
-            U_init: (N, nu) initial control sequence (will be clipped to [u_lb, u_ub])
+            U_init: (N, nu) initial control sequence (clipped to [u_lb, u_ub])
         Returns:
             X:      (N+1, nx) final state trajectory
             U:      (N, nu)   final control sequence
@@ -266,21 +419,26 @@ class iLQRBase(ABC):
         N      = U_init.shape[0]
         nx, nu = dyn.nx, dyn.nu
 
-        max_iter   = cfg.max_iter
-        tol        = cfg.tol
-        mu         = cfg.mu
-        mu_min     = cfg.mu_min
-        mu_max     = cfg.mu_max
-        mu_factor  = cfg.mu_factor
-        alpha_init = cfg.alpha_init
-        alpha_beta = cfg.alpha_beta
-        alpha_min  = cfg.alpha_min
-        c1         = cfg.armijo_c
+        max_iter = cfg.max_iter
+        tol      = cfg.tol
+        mu       = cfg.mu
+        mu_max   = cfg.mu_max
+        K_ls     = max(1, cfg.num_linesearch_candidates)
+        a_min    = cfg.min_linesearch_step
+
+        # log-spaced alphas, last one pinned to 0 so the nominal is always a candidate
+        # (mujoco_mpc/mjpc/planners/ilqg/planner.cc:386-388)
+        if K_ls == 1:
+            alphas = np.array([1.0])
+        else:
+            alphas = np.concatenate([
+                np.geomspace(1.0, a_min, K_ls - 1),
+                np.array([0.0]),
+            ])
 
         # initial open-loop rollout of U_init (with clipping)
-        X = np.empty((N + 1, nx)); 
+        X = np.empty((N + 1, nx)); X[0] = x0
         U = np.empty((N, nu))
-        X[0] = x0
         xk = x0.copy()
         for k in range(N):
             U[k] = np.clip(U_init[k], dyn.u_lb, dyn.u_ub)
@@ -290,73 +448,62 @@ class iLQRBase(ABC):
         J_hist = [float(J)]
         print(f"[iLQR] iter   0: J={float(J):.4f}")
 
-        # main iLQR loop
+        mu_rate = 1.0   # same-direction acceleration factor (mjpc)
+
         it = 0
         while it < max_iter:
-            # linearize + backward pass
+            # linearize + backward pass (with inline mu-bump retry on Cholesky failure)
             Ad_seq, Bd_seq = self.linearize_about_trajectory(X, U)
-            k_ff, K_fb, dV1, ok = self.backward_pass(X, U, Ad_seq, Bd_seq, mu)
+            k_ff, K_fb, dV1, dV2, mu, ok = self.backward_pass(X, U, Ad_seq, Bd_seq, mu)
 
-            # backward pass failed -> bump mu and retry (no iteration bump)
             if not ok:
-                mu = min(mu * mu_factor, mu_max)
+                # backward pass exhausted internal retries; escalate via z-ratio path
+                mu, mu_rate = self._update_mu(mu, mu_rate, float("nan"), float("nan"))
                 print(f"[iLQR] iter {it:3d}: backward pass failed, mu -> {mu:.2e}")
                 if mu >= mu_max:
                     print(f"[iLQR] mu hit mu_max={mu_max:.2e}; stopping.")
                     break
                 continue
 
-            # Classic Armijo line search with geometric backtracking:
-            #   start at alpha = alpha_init; multiply by alpha_beta on each rejection;
-            #   stop when alpha < alpha_min (-> reject this backward pass, bump mu).
-            # First-order predicted reduction along the iLQR search direction:
-            #   E(a) = -a * dV1,   with dV1 = sum_k k_ff_k^T Q_u_k  (= dJ/da at a=0).
-            # Accept iff   (J - J_try) >= c1 * E(a).
-            accepted     = False
-            alpha_used   = None
-            dJ           = 0.0
-            z_used       = 0.0
-            exp_red_used = 0.0
+            # parallel multi-α line search
+            X_all, U_all, J_all, _failed = self.forward_pass_batched(
+                x0, X, U, k_ff, K_fb, alphas
+            )
 
-            # check if the search direction is a descent direction
-            if dV1 >= 0.0:
-                # not a descent direction; bail out so the outer loop bumps mu
-                # (Quu_reg likely lost positive definiteness)
-                a = alpha_min - 1.0
-            else:
-                a = alpha_init
+            winner   = int(np.argmin(J_all))
+            a_star   = float(alphas[winner])
+            J_try    = float(J_all[winner])
+            dJ       = float(J) - J_try
+            # quadratic expected improvement: E(α) = -α (dV1 + α dV2)
+            # (mujoco_mpc/mjpc/planners/ilqg/planner.cc:562-567)
+            exp_red  = -a_star * (dV1 + a_star * dV2)
 
-            while a >= alpha_min:
-                exp_red = -a * dV1                   # first-order expected reduction (> 0)
-                X_try, U_try, J_try = self.forward_pass(x0, X, U, k_ff, K_fb, a)
-                dJ_actual = float(J) - float(J_try)
-                if dJ_actual >= c1 * exp_red:
-                    z_used       = dJ_actual / exp_red
-                    exp_red_used = exp_red
-                    dJ           = dJ_actual
-                    X, U, J      = X_try, U_try, J_try
-                    accepted     = True
-                    alpha_used   = a
-                    break
-                a *= alpha_beta
+            # mjpc-style accept: any real improvement (candidate set includes α=0)
+            accepted = (dJ > 0.0) and np.isfinite(J_try)
 
-            # good step: decrease mu, count iteration, log, check convergence
             if accepted:
                 it += 1
-                mu = max(mu / mu_factor, mu_min)
+                X, U, J = X_all[winner], U_all[winner], J_try
                 J_hist.append(float(J))
+
+                # z-ratio mu update (Tassa)
+                z = (dJ / exp_red) if exp_red > 0.0 else float("nan")
+                mu, mu_rate = self._update_mu(mu, mu_rate, z, a_star)
+
                 print(f"[iLQR] iter {it:3d}: J={float(J):.4f}  dJ={dJ:.3e}  "
-                      f"alpha={alpha_used:.4f}  z={z_used:.2f}  "
-                      f"E={exp_red_used:.3e}  mu={mu:.2e}")
-                if abs(dJ) < tol or (exp_red_used > 0.0 and exp_red_used < tol):
+                      f"alpha={a_star:.4f}  z={z:.2f}  "
+                      f"E={exp_red:.3e}  mu={mu:.2e}")
+
+                # convergence on actual or expected reduction
+                if abs(dJ) < tol or (exp_red > 0.0 and exp_red < tol):
                     print(f"[iLQR] converged: |dJ|={abs(dJ):.2e}, "
-                          f"E={exp_red_used:.2e} < tol={tol:.2e}")
+                          f"E={exp_red:.2e} < tol={tol:.2e}")
                     break
-            # bad step: increase mu and retry (no iteration bump)
             else:
-                mu = min(mu * mu_factor, mu_max)
+                # no candidate improved -> force-grow mu via "bad" path
+                mu, mu_rate = self._update_mu(mu, mu_rate, float("nan"), float("nan"))
                 print(f"[iLQR] iter {it:3d}: line search failed "
-                      f"(dV1={dV1:.2e}), mu -> {mu:.2e}")
+                      f"(dV1={dV1:.2e}, dV2={dV2:.2e}), mu -> {mu:.2e}")
                 if mu >= mu_max:
                     print(f"[iLQR] mu hit mu_max={mu_max:.2e}; stopping.")
                     break
