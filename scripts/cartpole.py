@@ -187,10 +187,11 @@ if __name__ == "__main__":
     axs[1, 1].set_yscale("log")
     fig.tight_layout()
 
-    # ---- save ----
-    results_dir = os.path.abspath(os.path.join(_here, "..", "results"))
+    # ---- save (per-script subdir: results/<script_name>/) ----
+    script_name = os.path.splitext(os.path.basename(__file__))[0]
+    results_dir = os.path.abspath(os.path.join(_here, "..", "results", script_name))
     os.makedirs(results_dir, exist_ok=True)
-    fig.savefig(os.path.join(results_dir, "cartpole_ilqr.png"), dpi=150)
+    fig.savefig(os.path.join(results_dir, "plot.png"), dpi=150)
     np.savetxt(os.path.join(results_dir, "state.csv"), X,
                delimiter=",",
                header="cart_pos,pole_angle,cart_vel,pole_vel", comments="")

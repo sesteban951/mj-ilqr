@@ -2,14 +2,22 @@
 #
 # Playback an iLQR-optimized trajectory in MuJoCo's passive viewer.
 #
-# Reads:
-#   results/state.csv   (N+1, nx=2*nq) rows: [qpos; qvel]
-#   results/time.csv    (N+1,) timestamps
-#   results/model.txt   path of the XML used, relative to repo/models/
+# Each producer script (e.g. cartpole.py, cartpole_mpc.py) writes its outputs
+# under results/<script_name>/. Pick which subdir to play back with a CLI arg:
+#
+#   python scripts/playback.py                # most-recently-modified subdir
+#   python scripts/playback.py cartpole       # results/cartpole/
+#   python scripts/playback.py cartpole_mpc   # results/cartpole_mpc/
+#
+# Reads from the chosen subdir:
+#   state.csv   (N+1, nx=2*nq) rows: [qpos; qvel]
+#   time.csv    (N+1,) timestamps
+#   model.txt   path of the XML used, relative to repo/models/
 #
 ##
 
 import os
+import sys
 import time
 import numpy as np
 import mujoco
@@ -22,12 +30,51 @@ def load_trajectory(results_dir):
     return X, t
 
 
-def main():
-    here        = os.path.dirname(os.path.abspath(__file__))
-    repo        = os.path.abspath(os.path.join(here, ".."))
-    results_dir = os.path.join(repo, "results")
+def _resolve_results_dir(results_root, requested=None):
+    """Pick the results subdir to replay.
 
-    # load the XML name recorded by cartpole.py (e.g. "cartpole/cartpole.xml")
+    - If `requested` is given, use results_root/requested.
+    - Else pick the most-recently-modified subdir containing state.csv.
+    Errors out with a helpful message if nothing valid is found.
+    """
+    if requested is not None:
+        d = os.path.join(results_root, requested)
+        if not os.path.isfile(os.path.join(d, "state.csv")):
+            raise SystemExit(
+                f"[playback] {d}/state.csv not found.\n"
+                f"Available subdirs: {sorted(os.listdir(results_root)) if os.path.isdir(results_root) else '(none)'}"
+            )
+        return d
+
+    if not os.path.isdir(results_root):
+        raise SystemExit(f"[playback] {results_root} does not exist. Run a producer script first.")
+
+    candidates = []
+    for name in os.listdir(results_root):
+        sub = os.path.join(results_root, name)
+        if os.path.isfile(os.path.join(sub, "state.csv")):
+            candidates.append((os.path.getmtime(sub), name, sub))
+
+    if not candidates:
+        raise SystemExit(
+            f"[playback] no results subdir under {results_root} contains state.csv.\n"
+            f"Run scripts/cartpole.py or scripts/cartpole_mpc.py first."
+        )
+
+    candidates.sort(reverse=True)
+    print(f"[playback] no subdir specified; using most recent: '{candidates[0][1]}'")
+    return candidates[0][2]
+
+
+def main():
+    here         = os.path.dirname(os.path.abspath(__file__))
+    repo         = os.path.abspath(os.path.join(here, ".."))
+    results_root = os.path.join(repo, "results")
+
+    requested   = sys.argv[1] if len(sys.argv) > 1 else None
+    results_dir = _resolve_results_dir(results_root, requested)
+
+    # load the XML name recorded by the producer (e.g. "cartpole/cartpole.xml")
     with open(os.path.join(results_dir, "model.txt"), "r") as f:
         xml_rel = f.read().strip()
     xml_path = os.path.join(repo, "models", xml_rel)

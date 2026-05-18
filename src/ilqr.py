@@ -51,6 +51,9 @@ class iLQRConfig:
     num_linesearch_candidates: int   = 8
     min_linesearch_step:       float = 1e-3
 
+    # silence per-iteration prints in solve() (useful for MPC inner solves)
+    verbose: bool = True
+
     # linearization method: "sampling" or "mujoco_fd"
     linearize_method: str = "sampling"
 
@@ -446,7 +449,9 @@ class iLQRBase(ABC):
             X[k + 1] = xk
         J = self.cost(X, U)
         J_hist = [float(J)]
-        print(f"[iLQR] iter   0: J={float(J):.4f}")
+        verbose = cfg.verbose
+        if verbose:
+            print(f"[iLQR] iter   0: J={float(J):.4f}")
 
         mu_rate = 1.0   # same-direction acceleration factor (mjpc)
 
@@ -459,9 +464,11 @@ class iLQRBase(ABC):
             if not ok:
                 # backward pass exhausted internal retries; escalate via z-ratio path
                 mu, mu_rate = self._update_mu(mu, mu_rate, float("nan"), float("nan"))
-                print(f"[iLQR] iter {it:3d}: backward pass failed, mu -> {mu:.2e}")
+                if verbose:
+                    print(f"[iLQR] iter {it:3d}: backward pass failed, mu -> {mu:.2e}")
                 if mu >= mu_max:
-                    print(f"[iLQR] mu hit mu_max={mu_max:.2e}; stopping.")
+                    if verbose:
+                        print(f"[iLQR] mu hit mu_max={mu_max:.2e}; stopping.")
                     break
                 continue
 
@@ -490,26 +497,31 @@ class iLQRBase(ABC):
                 z = (dJ / exp_red) if exp_red > 0.0 else float("nan")
                 mu, mu_rate = self._update_mu(mu, mu_rate, z, a_star)
 
-                print(f"[iLQR] iter {it:3d}: J={float(J):.4f}  dJ={dJ:.3e}  "
-                      f"alpha={a_star:.4f}  z={z:.2f}  "
-                      f"E={exp_red:.3e}  mu={mu:.2e}")
+                if verbose:
+                    print(f"[iLQR] iter {it:3d}: J={float(J):.4f}  dJ={dJ:.3e}  "
+                          f"alpha={a_star:.4f}  z={z:.2f}  "
+                          f"E={exp_red:.3e}  mu={mu:.2e}")
 
                 # convergence on actual or expected reduction
                 if abs(dJ) < tol or (exp_red > 0.0 and exp_red < tol):
-                    print(f"[iLQR] converged: |dJ|={abs(dJ):.2e}, "
-                          f"E={exp_red:.2e} < tol={tol:.2e}")
+                    if verbose:
+                        print(f"[iLQR] converged: |dJ|={abs(dJ):.2e}, "
+                              f"E={exp_red:.2e} < tol={tol:.2e}")
                     break
             else:
                 # no candidate improved -> force-grow mu via "bad" path
                 mu, mu_rate = self._update_mu(mu, mu_rate, float("nan"), float("nan"))
-                print(f"[iLQR] iter {it:3d}: line search failed "
-                      f"(dV1={dV1:.2e}, dV2={dV2:.2e}), mu -> {mu:.2e}")
+                if verbose:
+                    print(f"[iLQR] iter {it:3d}: line search failed "
+                          f"(dV1={dV1:.2e}, dV2={dV2:.2e}), mu -> {mu:.2e}")
                 if mu >= mu_max:
-                    print(f"[iLQR] mu hit mu_max={mu_max:.2e}; stopping.")
+                    if verbose:
+                        print(f"[iLQR] mu hit mu_max={mu_max:.2e}; stopping.")
                     break
 
-        print(f"[iLQR] done in {len(J_hist) - 1} accepted iterations. "
-              f"J: {J_hist[0]:.4f} -> {J_hist[-1]:.4f}")
+        if verbose:
+            print(f"[iLQR] done in {len(J_hist) - 1} accepted iterations. "
+                  f"J: {J_hist[0]:.4f} -> {J_hist[-1]:.4f}")
         return X, U, J_hist
 
 
